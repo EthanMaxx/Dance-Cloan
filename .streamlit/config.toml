@@ -1,3 +1,7 @@
 [server]
 enableXsrfProtection = true
 headless = true
+[server]
+enableXsrfProtection = true
+headless = true
+fileWatcherType = "poll"
