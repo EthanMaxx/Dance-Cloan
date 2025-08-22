@@ -1,8 +1,7 @@
 streamlit
-opencv-python-headless==4.9.0.80
-mediapipe==0.10.14
-matplotlib==3.8.4
-numpy==1.26.4
-streamlit-webrtc==0.47.7
-
+opencv-python-headless==4.8.1.78
+mediapipe==0.10.9
+matplotlib==3.7.2
+numpy==1.24.3
+streamlit-webrtc==0.47.1
 
