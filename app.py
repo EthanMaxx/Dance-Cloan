@@ -7,8 +7,8 @@ from typing import Tuple, List, Optional
 import streamlit as st
 import numpy as np
 import cv2
-
 import mediapipe as mp
+import av
 from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, WebRtcMode
 
 # -----------------------------
@@ -33,37 +33,29 @@ st.write(
 # -----------------------------
 with st.sidebar:
     st.header("Settings")
-
     color_change_interval = st.slider("Color change interval (sec)", 1, 10, 3)
     glow_thickness = st.slider("Glow line thickness", 1, 20, 10)
     joint_radius = st.slider("Glow joint radius", 2, 20, 8)
     clone_offset_x = st.slider("Clone horizontal offset (px)", -400, 400, 0)
-
     model_complexity = st.selectbox("Model complexity", [0, 1, 2], index=1)
-
     det_conf = st.slider("Min detection confidence", 0.10, 1.00, 0.60, step=0.01)
     trk_conf = st.slider("Min tracking confidence", 0.10, 1.00, 0.60, step=0.01)
     smooth_lms = st.checkbox("Smooth landmarks", value=True)
-
 
 # -----------------------------
 # MediaPipe helpers
 # -----------------------------
 mp_drawing = mp.solutions.drawing_utils
 mp_pose = mp.solutions.pose
-
 POSE_CONNECTIONS = list(mp_pose.POSE_CONNECTIONS)
 
 
 def _cycle_color(t_seconds: float, period: float) -> Tuple[int, int, int]:
     """Cycle through bright neon-like colors over time."""
-    # Map time to a color wheel
-    phase = (t_seconds % period) / period  # 0-1
-    # Create RGB from three shifted sinusoids for neon palette
+    phase = (t_seconds % period) / period
     r = int(127.5 * (1 + math.sin(2 * math.pi * (phase))))
     g = int(127.5 * (1 + math.sin(2 * math.pi * (phase + 1 / 3))))
     b = int(127.5 * (1 + math.sin(2 * math.pi * (phase + 2 / 3))))
-    # Boost saturation
     r = min(255, int(r * 1.2))
     g = min(255, int(g * 1.2))
     b = min(255, int(b * 1.2))
@@ -72,18 +64,15 @@ def _cycle_color(t_seconds: float, period: float) -> Tuple[int, int, int]:
 
 def _draw_neon_stick_figure(
     frame_bgr: np.ndarray,
-    landmarks: List[Tuple[int, int]],
+    landmarks: List[Optional[Tuple[int, int]]],
     color: Tuple[int, int, int],
     glow_thickness: int,
     joint_radius: int,
 ):
     """Draw a glowing stick figure given landmark pixel coordinates."""
-    h, w = frame_bgr.shape[:2]
-
-    # Soft glow by drawing thicker translucent layers first
     overlay = frame_bgr.copy()
 
-    # Draw connections
+    # Lines
     for (i1, i2) in POSE_CONNECTIONS:
         if i1 < len(landmarks) and i2 < len(landmarks):
             p1 = landmarks[i1]
@@ -91,16 +80,15 @@ def _draw_neon_stick_figure(
             if p1 is not None and p2 is not None:
                 cv2.line(overlay, p1, p2, color, thickness=glow_thickness, lineType=cv2.LINE_AA)
 
-    # Draw joints
+    # Joints
     for p in landmarks:
         if p is not None:
             cv2.circle(overlay, p, joint_radius, color, -1, lineType=cv2.LINE_AA)
 
-    # Blend overlay for glow effect
-    alpha = 0.4
-    cv2.addWeighted(overlay, alpha, frame_bgr, 1 - alpha, 0, frame_bgr)
+    # Glow blend
+    cv2.addWeighted(overlay, 0.4, frame_bgr, 0.6, 0, frame_bgr)
 
-    # Sharper bright pass
+    # Sharper pass
     for (i1, i2) in POSE_CONNECTIONS:
         if i1 < len(landmarks) and i2 < len(landmarks):
             p1 = landmarks[i1]
@@ -113,10 +101,10 @@ def _draw_neon_stick_figure(
 
 
 def _extract_landmarks_px(results, width: int, height: int) -> List[Optional[Tuple[int, int]]]:
-    """Convert MediaPipe normalized landmarks to pixel coordinates; returns list indexed by landmark id."""
+    """Convert MediaPipe normalized landmarks to pixel coordinates."""
     if not results.pose_landmarks:
         return [None] * 33
-    pts = []
+    pts: List[Optional[Tuple[int, int]]] = []
     for lm in results.pose_landmarks.landmark:
         if lm.visibility is not None and lm.visibility < 0.2:
             pts.append(None)
@@ -127,7 +115,6 @@ def _extract_landmarks_px(results, width: int, height: int) -> List[Optional[Tup
             pts.append((x, y))
         else:
             pts.append(None)
-    # Ensure length 33
     if len(pts) < 33:
         pts += [None] * (33 - len(pts))
     return pts
@@ -143,44 +130,36 @@ def render_neon_clone_frame(
     clone_offset_x: int,
 ) -> np.ndarray:
     """Run pose, draw neon stick figure and its mirrored clone."""
-    # Work copy
     frame = frame_bgr.copy()
     h, w = frame.shape[:2]
 
-    # Pose inference expects RGB
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     results = pose_processor.process(rgb)
 
-    # Extract pixel landmarks
     pts = _extract_landmarks_px(results, w, h)
     if all(p is None for p in pts):
-        return frame  # nothing to draw
+        return frame
 
-    # Time-based neon color
     color = _cycle_color(now_seconds, color_period)
 
-    # Draw on main subject
     _draw_neon_stick_figure(frame, pts, color, glow_thick, joint_rad)
 
-    # Create mirrored clone horizontally and offset
-    # Flip X across image center
-    mirrored = []
+    # Mirror horizontally
+    mirrored: List[Optional[Tuple[int, int]]] = []
     for p in pts:
         if p is None:
             mirrored.append(None)
         else:
             x, y = p
-            mx = w - x  # mirror around center
-            mirrored.append((mx, y))
+            mirrored.append((w - x, y))
 
     clone = frame.copy()
     _draw_neon_stick_figure(clone, mirrored, color, glow_thick, joint_rad)
 
-    # Shift clone horizontally
+    # Shift clone
     M = np.float32([[1, 0, clone_offset_x], [0, 1, 0]])
     shifted = cv2.warpAffine(clone, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_TRANSPARENT)
 
-    # Blend clone onto original
     blended = cv2.addWeighted(frame, 1.0, shifted, 0.6, 0)
     return blended
 
@@ -197,12 +176,10 @@ class NeonCloneProcessor(VideoTransformerBase):
             min_tracking_confidence=self.cfg["trk_conf"],
             smooth_landmarks=self.cfg["smooth_lms"],
         )
-        # For deterministic color when using frame count, we still rely on real time for live
         self.t0 = time.time()
 
     def recv(self, frame):
         img = frame.to_ndarray(format="bgr24")
-
         now_s = time.time() - self.t0
         out = render_neon_clone_frame(
             img,
@@ -256,7 +233,6 @@ with tab_video:
     process_btn = st.button("Process Video", disabled=up is None)
 
     if process_btn and up:
-        # Save upload to a temp file
         src_suffix = os.path.splitext(up.name)[1] or ".mp4"
         src_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=src_suffix)
         src_tmp.write(up.read())
@@ -271,7 +247,6 @@ with tab_video:
             src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-            # Resolve output size
             if downscale_to == "1280x720":
                 out_w, out_h = 1280, 720
             elif downscale_to == "854x480":
@@ -279,7 +254,6 @@ with tab_video:
             else:
                 out_w, out_h = src_w, src_h
 
-            # Preserve aspect ratio when downscaling
             if (out_w, out_h) != (src_w, src_h):
                 scale = min(out_w / src_w, out_h / src_h)
                 out_w = int(src_w * scale)
@@ -289,14 +263,12 @@ with tab_video:
             out_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
             writer = cv2.VideoWriter(out_path, fourcc, fps, (out_w, out_h))
 
-            # Build a CPU pose processor
             with mp_pose.Pose(
                 model_complexity=model_complexity,
                 min_detection_confidence=det_conf,
                 min_tracking_confidence=trk_conf,
                 smooth_landmarks=smooth_lms,
             ) as pose:
-                # progress
                 max_frames_by_time = int(max_seconds * fps)
                 max_frames = min(total_frames if total_frames > 0 else max_frames_by_time, max_frames_by_time)
                 prog = st.progress(0.0)
@@ -309,7 +281,6 @@ with tab_video:
                     if (src_w, src_h) != (out_w, out_h):
                         frame = cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_AREA)
 
-                    # Use deterministic time based on frame index for stable color cycling
                     now_s = i / fps
                     out = render_neon_clone_frame(
                         frame,
@@ -322,7 +293,6 @@ with tab_video:
                     )
 
                     writer.write(out)
-
                     if max_frames > 0:
                         prog.progress(min(0.999, (i + 1) / max_frames))
                     status.text(f"Processing frame {i+1}/{max_frames} ...")
@@ -342,12 +312,10 @@ with tab_video:
                 mime="video/mp4",
             )
 
-            # Cleanup the uploaded file (keep output until session ends)
             try:
                 os.unlink(src_tmp.name)
             except Exception:
                 pass
-
 
 # -----------------------------
 # Footer
